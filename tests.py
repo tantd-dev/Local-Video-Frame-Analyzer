@@ -226,16 +226,125 @@ def test_invalid_json_handling():
         shutil.rmtree(tmpdir)
 
 
+def test_batch_failure_resilience():
+    """TEST 4: 98 frames, one batch intentionally fails → other batches continue processing."""
+    from PySide6.QtCore import QCoreApplication
+    _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+    from core.frame_loader import FrameInfo
+    from providers.base import AIProvider
+    from ui.main_window import BatchWorker
+
+    class MockProviderWithFailure(AIProvider):
+        @property
+        def provider_name(self) -> str:
+            return "mock_resilience"
+
+        def list_models(self) -> list[str]:
+            return ["mock-vision"]
+
+        def analyze_images(self, images, prompt, model, **kwargs) -> str:
+            # Batch 3 intentionally fails with invalid non-JSON output
+            if "Batch 3 " in prompt:
+                return "Error: failed to analyze frame batch"
+            return '{"summary": "Batch processed successfully", "scenes": []}'
+
+        def generate_text(self, prompt, model, **kwargs) -> str:
+            return '{"overall_summary": "Aggregation complete"}'
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        frames = []
+        for i in range(1, 99):
+            path = os.path.join(tmpdir, f"frame_{i:04d}_{i*9:06d}.jpg")
+            with open(path, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0")  # Minimal JPEG header
+            frames.append(FrameInfo(f"frame_{i:04d}_{i*9:06d}.jpg", path, i, i * 9))
+
+        batches = create_batches(frames, 10)
+        assert len(batches) == 10
+
+        run_dir = os.path.join(tmpdir, "analysis", "run_test_fail")
+        os.makedirs(run_dir, exist_ok=True)
+
+        provider = MockProviderWithFailure("http://mock-url")
+        worker = BatchWorker(
+            batches=batches,
+            provider=provider,
+            model="mock-vision",
+            user_prompt="Analyze frames",
+            run_dir=run_dir,
+            run_id="run_test_fail",
+            total_batches=10,
+            temperature=0.0,
+            max_tokens=256,
+            timeout=10,
+            max_image_dim=None,
+        )
+
+        completed_events = []
+        failed_events = []
+        worker.batch_completed.connect(lambda bid, res: completed_events.append(bid))
+        worker.batch_failed.connect(lambda bid, err: failed_events.append(bid))
+
+        # Run worker synchronously
+        worker.run()
+
+        # Check results
+        statuses = get_batch_statuses(run_dir, 10)
+        assert statuses['failed'] == [3], f"Expected batch 3 to fail, got {statuses['failed']}"
+        assert len(statuses['successful']) == 9
+        assert 3 not in statuses['successful']
+        assert statuses['pending'] == []
+        assert len(completed_events) == 9
+        assert failed_events == [3]
+
+        print("  ✓ TEST 4: 98 frames / batch 3 fails → 9 other batches continue & complete")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_lmstudio_unavailable():
+    """TEST 7: LM Studio unavailable → clear error without application crash."""
+    import requests
+    from providers.lmstudio import LMStudioProvider
+    provider = LMStudioProvider("http://127.0.0.1:59999")
+    try:
+        provider.list_models()
+        assert False, "Expected connection error"
+    except requests.RequestException as e:
+        # Provider cleanly raises RequestException which GUI catches in _refresh_models
+        assert isinstance(e, requests.RequestException)
+        print("  ✓ TEST 7: LM Studio unavailable → caught RequestException gracefully")
+
+
+def test_ollama_unavailable():
+    """TEST 8: Ollama unavailable → clear error without application crash."""
+    import requests
+    from providers.ollama import OllamaProvider
+    provider = OllamaProvider("http://127.0.0.1:59999")
+    try:
+        provider.list_models()
+        assert False, "Expected connection error"
+    except requests.RequestException as e:
+        # Provider cleanly raises RequestException which GUI catches in _refresh_models
+        assert isinstance(e, requests.RequestException)
+        print("  ✓ TEST 8: Ollama unavailable → caught RequestException gracefully")
+
+
 if __name__ == "__main__":
-    print("\n=== Running Core Logic Tests ===\n")
+    print("\n=== Running Core Logic & Spec Tests ===\n")
     test_parse_frame_filename()
     test_format_duration()
     test_is_image_file()
-    test_batch_creation_98_frames()
-    test_batch_creation_100_frames()
-    test_batch_creation_7_frames()
+    test_batch_creation_98_frames()      # TEST 1
+    test_batch_creation_100_frames()     # TEST 2
+    test_batch_creation_7_frames()       # TEST 3
+    test_batch_failure_resilience()      # TEST 4
+    test_resume_support()                # TEST 5
+    test_invalid_json_handling()         # TEST 6
+    test_lmstudio_unavailable()          # TEST 7
+    test_ollama_unavailable()            # TEST 8
     test_json_extraction()
     test_frame_discovery()
-    test_resume_support()
-    test_invalid_json_handling()
-    print("\n=== All tests passed ✓ ===\n")
+    print("\n=== All 8 specification tests passed ✓ ===\n")
+
