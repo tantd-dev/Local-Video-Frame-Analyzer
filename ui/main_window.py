@@ -7,15 +7,18 @@ prompt, progress) and worker threads for non-blocking AI processing.
 import json
 import logging
 import os
+import time
 import traceback
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot, QUrl, QTimer
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
     QComboBox, QTextEdit, QProgressBar, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QSplitter, QTabWidget, QSizePolicy,
+    QFileDialog, QMessageBox, QSplitter, QTabWidget, QSizePolicy, QDialog,
+    QApplication,
 )
 
 from core.frame_loader import discover_frames, get_frame_stats, FrameInfo
@@ -366,6 +369,7 @@ class AggregationWorker(QObject):
         temperature: float,
         max_tokens: int,
         timeout: int,
+        batches_duration: float = 0.0,
     ):
         super().__init__()
         self.run_dir = run_dir
@@ -382,9 +386,11 @@ class AggregationWorker(QObject):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.batches_duration = batches_duration
 
     @Slot()
     def run(self):
+        started_at = datetime.now()
         try:
             self.log_message.emit("Building aggregation prompt...")
             full_prompt = build_aggregation_input(
@@ -427,6 +433,16 @@ class AggregationWorker(QObject):
                     )
                     return
 
+            finished_at = datetime.now()
+            agg_duration = round((finished_at - started_at).total_seconds(), 2)
+
+            batches_dur = self.batches_duration
+            if batches_dur <= 0.0:
+                batches_dur = round(sum(
+                    br.get('processing', {}).get('duration_seconds', 0.0)
+                    for br in self.batch_results
+                ), 2)
+
             # Count successful / failed
             successful_count = len(self.batch_results)
             failed_count = self.total_batches - successful_count
@@ -450,6 +466,11 @@ class AggregationWorker(QObject):
                     'successful': successful_count,
                     'failed': failed_count,
                 },
+                'timing': {
+                    'batches_duration_seconds': batches_dur,
+                    'aggregation_duration_seconds': agg_duration,
+                    'total_duration_seconds': round(batches_dur + agg_duration, 2),
+                },
                 'final_analysis': parsed,
                 'raw_response': raw_response,
             }
@@ -460,6 +481,7 @@ class AggregationWorker(QObject):
 
         except Exception as e:
             self.failed.emit(f"Aggregation error: {type(e).__name__}: {e}")
+
 
 
 # ===================================================================
@@ -481,6 +503,15 @@ class MainWindow(QMainWindow):
         self._worker: BatchWorker | None = None
         self._agg_thread: QThread | None = None
         self._agg_worker: AggregationWorker | None = None
+
+        # Timing state
+        self._batches_duration: float | None = None
+        self._batches_start_time: float | None = None
+        self._agg_duration: float | None = None
+        self._agg_start_time: float | None = None
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(500)
+        self._live_timer.timeout.connect(self._on_live_timer_tick)
 
         self._setup_ui()
         self._connect_signals()
@@ -651,6 +682,18 @@ class MainWindow(QMainWindow):
         stats_row.addWidget(self.lbl_pending)
         progress_layout.addLayout(stats_row)
 
+        timing_row = QHBoxLayout()
+        self.lbl_batches_time = QLabel("Batches Time: —")
+        self.lbl_agg_time = QLabel("Final Analysis Time: —")
+        self.lbl_total_time = QLabel("Total Time: —")
+        self.lbl_batches_time.setStyleSheet("color: #2c3e50; font-size: 11px;")
+        self.lbl_agg_time.setStyleSheet("color: #2c3e50; font-size: 11px;")
+        self.lbl_total_time.setStyleSheet("color: #16a085; font-size: 11px; font-weight: bold;")
+        timing_row.addWidget(self.lbl_batches_time)
+        timing_row.addWidget(self.lbl_agg_time)
+        timing_row.addWidget(self.lbl_total_time)
+        progress_layout.addLayout(timing_row)
+
         self.batch_list = QListWidget()
         self.batch_list.setMinimumHeight(150)
         progress_layout.addWidget(self.batch_list)
@@ -685,6 +728,39 @@ class MainWindow(QMainWindow):
         self.txt_agg_prompt.setMinimumHeight(100)
         prompt_tabs.addTab(self.txt_agg_prompt, "Aggregation Prompt")
 
+        # Corner widget for prompt_tabs to show timing & final_result.json on the same row with prompts
+        self.prompt_corner_widget = QWidget()
+        corner_layout = QHBoxLayout(self.prompt_corner_widget)
+        corner_layout.setContentsMargins(10, 2, 8, 2)
+        corner_layout.setSpacing(10)
+
+        self.lbl_prompt_timing = QLabel("⏱ Batches: — | Final Analysis: — | Total: —")
+        self.lbl_prompt_timing.setStyleSheet("color: #34495e; font-size: 11px; font-weight: 500;")
+
+        sep = QLabel("|")
+        sep.setStyleSheet("color: #bdc3c7;")
+
+        self.lbl_final_result_status = QLabel("📄 final_result.json: Not generated")
+        self.lbl_final_result_status.setStyleSheet("color: #7f8c8d; font-weight: bold; font-size: 11px;")
+
+        self.btn_view_final_result = QPushButton("View JSON")
+        self.btn_view_final_result.setFixedHeight(24)
+        self.btn_view_final_result.setEnabled(False)
+        self.btn_view_final_result.setToolTip("View final_result.json content")
+
+        self.btn_open_run_folder = QPushButton("Open Folder")
+        self.btn_open_run_folder.setFixedHeight(24)
+        self.btn_open_run_folder.setEnabled(False)
+        self.btn_open_run_folder.setToolTip("Open analysis run folder in Explorer")
+
+        corner_layout.addWidget(self.lbl_prompt_timing)
+        corner_layout.addWidget(sep)
+        corner_layout.addWidget(self.lbl_final_result_status)
+        corner_layout.addWidget(self.btn_view_final_result)
+        corner_layout.addWidget(self.btn_open_run_folder)
+
+        prompt_tabs.setCornerWidget(self.prompt_corner_widget, Qt.TopRightCorner)
+
         main_layout.addWidget(prompt_tabs)
 
         # --- Action Buttons ---
@@ -714,11 +790,14 @@ class MainWindow(QMainWindow):
         self.combo_provider.currentIndexChanged.connect(self._on_provider_changed)
         self.btn_refresh_models.clicked.connect(self._refresh_models)
         self.btn_refresh_runs.clicked.connect(self._refresh_runs)
+        self.combo_runs.currentIndexChanged.connect(self._on_run_selection_changed)
         self.btn_send_all.clicked.connect(lambda: self._start_processing('send_all'))
         self.btn_resume.clicked.connect(lambda: self._start_processing('resume'))
         self.btn_force_rerun.clicked.connect(lambda: self._start_processing('force'))
         self.btn_cancel.clicked.connect(self._cancel_processing)
         self.btn_aggregate.clicked.connect(self._start_aggregation)
+        self.btn_view_final_result.clicked.connect(self._show_final_result_dialog)
+        self.btn_open_run_folder.clicked.connect(self._open_current_run_folder)
 
     # ----- Folder Selection -----
 
@@ -812,11 +891,14 @@ class MainWindow(QMainWindow):
             )
             self._log(f"Error listing models: {e}")
 
-    # ----- Run Selection -----
+    # ----- Run Selection & Final Result UI -----
 
     def _refresh_runs(self):
+        self.combo_runs.blockSignals(True)
         self.combo_runs.clear()
         if not self._frame_folder:
+            self.combo_runs.blockSignals(False)
+            self._update_final_result_ui()
             return
 
         base = os.path.dirname(self._frame_folder)
@@ -827,13 +909,189 @@ class MainWindow(QMainWindow):
                 batch_size = r['config'].get('batch_size', '?')
                 model = r['config'].get('model', '?')
                 label += f"  (batch={batch_size}, model={model})"
+            fr_path = os.path.join(r['run_dir'], "final_result.json")
+            if os.path.exists(fr_path):
+                label += " [final ✓]"
             self.combo_runs.addItem(label, r)
+
+        self.combo_runs.blockSignals(False)
+        if self.combo_runs.count() > 0:
+            self._on_run_selection_changed()
+        else:
+            self._update_final_result_ui()
 
     def _get_selected_run(self) -> dict | None:
         idx = self.combo_runs.currentIndex()
         if idx < 0:
             return None
         return self.combo_runs.itemData(idx)
+
+    def _on_run_selection_changed(self):
+        run_info = self._get_selected_run()
+        if not run_info:
+            return
+        self._current_run_dir = run_info['run_dir']
+        self._current_run_id = run_info['run_id']
+
+        # Estimate batches duration from existing batch results
+        existing_results = load_all_successful_batches(self._current_run_dir, 1000)
+        if existing_results:
+            self._batches_duration = round(sum(
+                b.get('processing', {}).get('duration_seconds', 0.0)
+                for b in existing_results
+            ), 2)
+        else:
+            self._batches_duration = None
+
+        # Check if final_result.json exists
+        final_path = os.path.join(self._current_run_dir, "final_result.json")
+        if os.path.exists(final_path):
+            try:
+                with open(final_path, 'r', encoding='utf-8') as f:
+                    final_data = json.load(f)
+                timing = final_data.get('timing', {})
+                if 'aggregation_duration_seconds' in timing:
+                    self._agg_duration = timing['aggregation_duration_seconds']
+                if 'batches_duration_seconds' in timing:
+                    self._batches_duration = timing['batches_duration_seconds']
+            except Exception:
+                self._agg_duration = None
+        else:
+            self._agg_duration = None
+
+        self._update_timing_display()
+        self._update_final_result_ui()
+
+    def _update_final_result_ui(self):
+        """Update final_result.json display based on current run directory."""
+        if not self._current_run_dir or not os.path.isdir(self._current_run_dir):
+            self.lbl_final_result_status.setText("📄 final_result.json: Not generated")
+            self.lbl_final_result_status.setStyleSheet("color: #7f8c8d; font-weight: bold; font-size: 11px;")
+            self.lbl_final_result_status.setToolTip("No active run selected.")
+            self.btn_view_final_result.setEnabled(False)
+            self.btn_open_run_folder.setEnabled(False)
+            return
+
+        final_path = os.path.join(self._current_run_dir, "final_result.json")
+        self.btn_open_run_folder.setEnabled(True)
+
+        if os.path.exists(final_path):
+            try:
+                size_kb = os.path.getsize(final_path) / 1024.0
+            except Exception:
+                size_kb = 0.0
+
+            self.lbl_final_result_status.setText(f"✓ final_result.json: Ready ({size_kb:.1f} KB)")
+            self.lbl_final_result_status.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 11px;")
+            self.lbl_final_result_status.setToolTip(f"Full path:\n{final_path}")
+            self.btn_view_final_result.setEnabled(True)
+        else:
+            self.lbl_final_result_status.setText("📄 final_result.json: Not generated")
+            self.lbl_final_result_status.setStyleSheet("color: #7f8c8d; font-weight: bold; font-size: 11px;")
+            self.lbl_final_result_status.setToolTip(f"Not yet created in:\n{final_path}")
+            self.btn_view_final_result.setEnabled(False)
+
+    def _show_final_result_dialog(self):
+        if not self._current_run_dir:
+            return
+        final_path = os.path.join(self._current_run_dir, "final_result.json")
+        if not os.path.exists(final_path):
+            QMessageBox.warning(self, "Not Found", f"File does not exist:\n{final_path}")
+            return
+
+        try:
+            with open(final_path, 'r', encoding='utf-8') as f:
+                raw_text = f.read()
+            try:
+                formatted_json = json.dumps(json.loads(raw_text), indent=2, ensure_ascii=False)
+            except Exception:
+                formatted_json = raw_text
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to read file:\n{e}")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"final_result.json — {self._current_run_id}")
+        dlg.resize(850, 600)
+        vbox = QVBoxLayout(dlg)
+
+        path_lbl = QLabel(f"<b>File:</b> {final_path}")
+        path_lbl.setWordWrap(True)
+        vbox.addWidget(path_lbl)
+
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(formatted_json)
+        txt.setFontFamily("Consolas")
+        vbox.addWidget(txt)
+
+        btn_row = QHBoxLayout()
+        btn_open_ext = QPushButton("Open in External Viewer")
+        btn_copy = QPushButton("Copy JSON")
+        btn_close = QPushButton("Close")
+
+        btn_open_ext.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(final_path)))
+        btn_copy.clicked.connect(lambda: (QApplication.clipboard().setText(formatted_json), QMessageBox.information(dlg, "Copied", "JSON copied to clipboard!")))
+        btn_close.clicked.connect(dlg.accept)
+
+        btn_row.addWidget(btn_open_ext)
+        btn_row.addWidget(btn_copy)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        vbox.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _open_current_run_folder(self):
+        if self._current_run_dir and os.path.isdir(self._current_run_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._current_run_dir))
+
+    # ----- Timing Helpers -----
+
+    def _on_live_timer_tick(self):
+        if self._batches_start_time is not None:
+            self._batches_duration = time.time() - self._batches_start_time
+            self._update_timing_display(batches_running=True)
+        elif self._agg_start_time is not None:
+            self._agg_duration = time.time() - self._agg_start_time
+            self._update_timing_display(agg_running=True)
+
+    def _format_time_sec(self, seconds: float | None, is_running: bool = False) -> str:
+        if seconds is None:
+            return "—"
+        if seconds < 60:
+            text = f"{seconds:.1f}s"
+        else:
+            m = int(seconds // 60)
+            s = seconds % 60
+            text = f"{m}m {s:04.1f}s"
+        if is_running:
+            text += " (running...)"
+        return text
+
+    def _update_timing_display(
+        self,
+        batches_running: bool = False,
+        agg_running: bool = False,
+    ):
+        b_time_str = self._format_time_sec(self._batches_duration, is_running=batches_running)
+        a_time_str = self._format_time_sec(self._agg_duration, is_running=agg_running)
+
+        if self._batches_duration is not None or self._agg_duration is not None:
+            b_val = self._batches_duration or 0.0
+            a_val = self._agg_duration or 0.0
+            tot_val = b_val + a_val
+            tot_time_str = self._format_time_sec(tot_val, is_running=(batches_running or agg_running))
+        else:
+            tot_time_str = "—"
+
+        self.lbl_batches_time.setText(f"Batches Time: {b_time_str}")
+        self.lbl_agg_time.setText(f"Final Analysis Time: {a_time_str}")
+        self.lbl_total_time.setText(f"Total Time: {tot_time_str}")
+
+        self.lbl_prompt_timing.setText(
+            f"⏱ Batches: {b_time_str} | Final Analysis: {a_time_str} | Total: {tot_time_str}"
+        )
 
     # ----- Processing -----
 
@@ -895,6 +1153,15 @@ class MainWindow(QMainWindow):
 
         self._current_run_dir = run_dir
         self._current_run_id = run_id
+
+        # Reset & start timing for batches
+        self._batches_start_time = time.time()
+        self._batches_duration = 0.0
+        self._agg_start_time = None
+        self._agg_duration = None
+        self._update_timing_display(batches_running=True)
+        self._update_final_result_ui()
+        self._live_timer.start()
 
         # Save config
         config = {
@@ -1031,9 +1298,16 @@ class MainWindow(QMainWindow):
         self._update_stats_labels()
 
     def _on_all_completed(self, summary: dict):
-        self._set_processing_ui(False)
-        cancelled = summary.get('cancelled', False)
+        self._live_timer.stop()
+        if self._batches_start_time is not None:
+            self._batches_duration = round(time.time() - self._batches_start_time, 2)
+            self._batches_start_time = None
 
+        self._set_processing_ui(False)
+        self._update_timing_display()
+        self._update_final_result_ui()
+
+        cancelled = summary.get('cancelled', False)
         status = "cancelled" if cancelled else "completed"
         self.lbl_progress_status.setText(
             f"Processing {status}: "
@@ -1104,6 +1378,14 @@ class MainWindow(QMainWindow):
             f"successful batch results..."
         )
 
+        # Start timing for aggregation
+        self._agg_start_time = time.time()
+        self._agg_duration = 0.0
+        self._update_timing_display(agg_running=True)
+        self.lbl_final_result_status.setText("⏳ final_result.json: Generating...")
+        self.lbl_final_result_status.setStyleSheet("color: #e67e22; font-weight: bold; font-size: 11px;")
+        self._live_timer.start()
+
         self._agg_worker = AggregationWorker(
             run_dir=self._current_run_dir,
             run_id=self._current_run_id,
@@ -1119,6 +1401,7 @@ class MainWindow(QMainWindow):
             temperature=self.spin_temperature.value(),
             max_tokens=self.spin_max_tokens.value(),
             timeout=self.spin_timeout.value(),
+            batches_duration=self._batches_duration or 0.0,
         )
         self._agg_thread = QThread()
         self._agg_worker.moveToThread(self._agg_thread)
@@ -1135,18 +1418,35 @@ class MainWindow(QMainWindow):
         self._agg_thread.start()
 
     def _on_aggregation_completed(self, result: dict):
+        self._live_timer.stop()
+        if self._agg_start_time is not None:
+            self._agg_duration = round(time.time() - self._agg_start_time, 2)
+            self._agg_start_time = None
+
         self.btn_aggregate.setEnabled(True)
         self.lbl_progress_status.setText("Aggregation completed ✓")
         self._log("Aggregation completed successfully.")
+        self._update_timing_display()
+        self._update_final_result_ui()
+        self._refresh_runs()
+
         QMessageBox.information(
             self, "Aggregation Complete",
             f"Final result saved to:\n{self._current_run_dir}\\final_result.json"
         )
 
     def _on_aggregation_failed(self, error: str):
+        self._live_timer.stop()
+        if self._agg_start_time is not None:
+            self._agg_duration = round(time.time() - self._agg_start_time, 2)
+            self._agg_start_time = None
+
         self.btn_aggregate.setEnabled(True)
         self.lbl_progress_status.setText("Aggregation failed ✗")
         self._log(f"Aggregation failed: {error}")
+        self._update_timing_display()
+        self.lbl_final_result_status.setText("✗ final_result.json: Failed")
+        self.lbl_final_result_status.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 11px;")
         QMessageBox.warning(self, "Aggregation Failed", error)
 
     # ----- Logging -----

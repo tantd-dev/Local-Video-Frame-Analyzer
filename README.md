@@ -106,10 +106,22 @@ Select provider, refresh models, pick one.
 | **Force Re-run** | Creates a new run, processes everything (ignores previous results) |
 | **Cancel** | Stops after the current batch finishes |
 
-### 6. Generate Final Analysis
+### 6. Generate Final Analysis & Execution Timing
 
 After batch processing completes, click **Generate Final Analysis**.  
 This reads all successful batch results and sends them (text-only, no images) to the model for aggregation.
+
+#### Timing Metrics & Final Result Bar
+The UI continuously tracks and displays:
+- **Batches Time**: Total execution duration of all batches.
+- **Final Analysis Time**: Duration of the aggregation step.
+- **Total Time**: Combined end-to-end processing time (Batches + Final Analysis).
+
+These metrics and the status of `final_result.json` are displayed:
+1. In the **Progress** panel below batch statistics.
+2. Directly on the **Prompt Tabs bar** (alongside "Batch Analysis Prompt" and "Aggregation Prompt") with quick action buttons:
+   - **View JSON**: View formatted final result directly in a dialog (with Copy & External Viewer support).
+   - **Open Folder**: Open the run directory in Windows Explorer.
 
 ---
 

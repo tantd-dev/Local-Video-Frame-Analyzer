@@ -13,6 +13,7 @@ import shutil
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.timestamp import parse_frame_filename, format_duration, is_image_file
@@ -228,8 +229,8 @@ def test_invalid_json_handling():
 
 def test_batch_failure_resilience():
     """TEST 4: 98 frames, one batch intentionally fails → other batches continue processing."""
-    from PySide6.QtCore import QCoreApplication
-    _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+    from PySide6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
     from core.frame_loader import FrameInfo
     from providers.base import AIProvider
     from ui.main_window import BatchWorker
@@ -331,6 +332,87 @@ def test_ollama_unavailable():
         print("  ✓ TEST 8: Ollama unavailable → caught RequestException gracefully")
 
 
+def test_timing_and_final_result_ui():
+    """TEST: Timing calculations & final_result.json UI integration."""
+    from PySide6.QtWidgets import QApplication
+    from ui.main_window import MainWindow, AggregationWorker
+    from providers.base import AIProvider
+
+    class MockTimingProvider(AIProvider):
+        @property
+        def provider_name(self) -> str:
+            return "mock"
+        def list_models(self) -> list[str]:
+            return ["m"]
+        def analyze_images(self, *args, **kwargs) -> str:
+            return "{}"
+        def generate_text(self, *args, **kwargs) -> str:
+            return '{"overall_summary": "Test aggregation complete"}'
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        win = MainWindow()
+        win._current_run_dir = tmpdir
+        win._batches_duration = 35.5
+        win._agg_duration = 12.5
+        win._update_timing_display()
+
+        # Check timing labels
+        assert "35.5s" in win.lbl_batches_time.text()
+        assert "12.5s" in win.lbl_agg_time.text()
+        assert "48.0s" in win.lbl_total_time.text()
+        assert "35.5s" in win.lbl_prompt_timing.text()
+        assert "12.5s" in win.lbl_prompt_timing.text()
+        assert "48.0s" in win.lbl_prompt_timing.text()
+
+        # Check AggregationWorker timing
+        worker = AggregationWorker(
+            run_dir=tmpdir,
+            run_id="run_timing_test",
+            batch_results=[{"batch_id": 1, "result": {"summary": "b1"}}],
+            provider=MockTimingProvider("http://mock"),
+            model="m",
+            aggregation_prompt="Aggregate",
+            frame_folder=tmpdir,
+            frame_count=10,
+            duration_seconds=90,
+            batch_size=10,
+            total_batches=1,
+            temperature=0.0,
+            max_tokens=128,
+            timeout=10,
+            batches_duration=35.5,
+        )
+        completed_results = []
+        worker.completed.connect(lambda r: completed_results.append(r))
+        worker.run()
+
+        assert len(completed_results) == 1
+        res = completed_results[0]
+        assert "timing" in res
+        assert res["timing"]["batches_duration_seconds"] == 35.5
+        assert res["timing"]["aggregation_duration_seconds"] >= 0
+        assert res["timing"]["total_duration_seconds"] >= 35.5
+
+        # Check that final_result.json was saved with timing
+        final_file = os.path.join(tmpdir, "final_result.json")
+        assert os.path.exists(final_file)
+        with open(final_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["timing"]["batches_duration_seconds"] == 35.5
+
+        # Check final_result.json UI update
+        win._update_final_result_ui()
+        assert "Ready" in win.lbl_final_result_status.text()
+        assert win.btn_view_final_result.isEnabled() is True
+        assert win.btn_open_run_folder.isEnabled() is True
+
+        print("  ✓ Timing & final_result.json UI tests passed")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 if __name__ == "__main__":
     print("\n=== Running Core Logic & Spec Tests ===\n")
     test_parse_frame_filename()
@@ -346,5 +428,7 @@ if __name__ == "__main__":
     test_ollama_unavailable()            # TEST 8
     test_json_extraction()
     test_frame_discovery()
-    print("\n=== All 8 specification tests passed ✓ ===\n")
+    test_timing_and_final_result_ui()    # New timing & UI features
+    print("\n=== All tests passed ✓ ===\n")
+
 
