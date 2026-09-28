@@ -8,35 +8,7 @@ a final unified analysis.
 import json
 
 
-DEFAULT_AGGREGATION_PROMPT = """You are analyzing a complete video using structured analysis results \
-from multiple chronological batches.
-
-The batches are ordered by timestamp.
-
-Based ONLY on the provided batch results, produce a final analysis.
-
-Return ONLY valid JSON.
-
-Use this structure:
-
-{
-  "overall_summary": "",
-  "likely_location": "",
-  "chronological_scenes": [],
-  "important_locations": [],
-  "important_objects": [],
-  "actions_and_events": [],
-  "visible_text": [],
-  "major_changes": [],
-  "uncertainties": []
-}
-
-Rules:
-- Do not invent information.
-- Distinguish observed information from inference.
-- If different batches contain conflicting information, preserve the uncertainty.
-- Use chronological information from the batches.
-- Return valid JSON only."""
+DEFAULT_AGGREGATION_PROMPT = "Đọc các file json và tạo một file final_result.json mới tổng hợp tất cả nội dung video từ các file này. Tôi chỉ cần file json thôi, đừng nói gì nhiều khác."
 
 
 def build_aggregation_input(batch_results: list[dict], aggregation_prompt: str) -> str:
