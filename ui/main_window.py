@@ -3,6 +3,7 @@ Main application window.
 
 Contains all GUI sections (frame folder, batch config, provider,
 prompt, progress) and worker threads for non-blocking AI processing.
+Supports both single-file and multi-file (batch) modes.
 """
 import json
 import logging
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
     QComboBox, QTextEdit, QProgressBar, QListWidget, QListWidgetItem,
     QFileDialog, QMessageBox, QSplitter, QTabWidget, QSizePolicy, QDialog,
-    QApplication,
+    QApplication, QStackedWidget, QFrame,
 )
 
 from core.frame_loader import discover_frames, get_frame_stats, FrameInfo
@@ -31,6 +32,7 @@ from core.result_manager import (
 from core.aggregation import (
     DEFAULT_AGGREGATION_PROMPT, build_aggregation_input, estimate_token_count,
 )
+from core.excel_reporter import append_video_result, create_or_load_workbook, HAS_OPENPYXL
 from providers.base import AIProvider
 from providers.lmstudio import LMStudioProvider
 from providers.ollama import OllamaProvider
@@ -478,6 +480,415 @@ class AggregationWorker(QObject):
             self.failed.emit(f"Aggregation error: {type(e).__name__}: {e}")
 
 
+# ===================================================================
+# Worker: Multi-Video Processing (runs in background thread)
+# ===================================================================
+
+class MultiVideoWorker(QObject):
+    """Processes multiple video folders sequentially.
+
+    For each video folder:
+      1. Discover frames
+      2. Create batches and process them
+      3. Run aggregation
+      4. Write result row to Excel
+    """
+
+    video_started = Signal(int, str)            # video_index (0-based), video_name
+    video_completed = Signal(int, str, dict)    # video_index, video_name, final_result
+    video_failed = Signal(int, str, str)        # video_index, video_name, error_msg
+    batch_log = Signal(str)                     # log line
+    batch_progress = Signal(int, int, int)      # video_index, batch_id, total_batches
+    all_videos_completed = Signal(dict)         # overall summary
+    log_message = Signal(str)
+
+    def __init__(
+        self,
+        video_folders: list[dict],   # list of {"name": str, "frames_path": str}
+        provider: AIProvider,
+        model: str,
+        batch_prompt: str,
+        aggregation_prompt: str,
+        batch_size: int,
+        temperature: float,
+        max_tokens: int,
+        timeout: int,
+        max_image_dim: int | None,
+        excel_path: str,
+    ):
+        super().__init__()
+        self.video_folders = video_folders
+        self.provider = provider
+        self.model = model
+        self.batch_prompt = batch_prompt
+        self.aggregation_prompt = aggregation_prompt
+        self.batch_size = batch_size
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.max_image_dim = max_image_dim
+        self.excel_path = excel_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @Slot()
+    def run(self):
+        total_videos = len(self.video_folders)
+        completed_count = 0
+        failed_count = 0
+        overall_start = time.time()
+
+        for idx, vf in enumerate(self.video_folders):
+            if self._cancelled:
+                self.log_message.emit("Multi-video processing cancelled by user.")
+                break
+
+            video_name = vf['name']
+            frames_path = vf['frames_path']
+
+            self.video_started.emit(idx, video_name)
+            self.log_message.emit(
+                f"═══ [{idx+1}/{total_videos}] Starting: {video_name} ═══"
+            )
+
+            try:
+                result = self._process_single_video(idx, video_name, frames_path)
+                if result is not None:
+                    completed_count += 1
+                    self.video_completed.emit(idx, video_name, result)
+                    self.log_message.emit(
+                        f"═══ [{idx+1}/{total_videos}] Completed: {video_name} ═══"
+                    )
+                else:
+                    failed_count += 1
+                    self.video_failed.emit(idx, video_name, "Processing returned no result")
+            except Exception as e:
+                failed_count += 1
+                error_msg = f"{type(e).__name__}: {e}"
+                self.log_message.emit(
+                    f"═══ [{idx+1}/{total_videos}] FAILED: {video_name} — {error_msg} ═══"
+                )
+                self.video_failed.emit(idx, video_name, error_msg)
+
+        overall_duration = round(time.time() - overall_start, 2)
+        summary = {
+            'total': total_videos,
+            'completed': completed_count,
+            'failed': failed_count,
+            'cancelled': self._cancelled,
+            'total_duration': overall_duration,
+        }
+        self.all_videos_completed.emit(summary)
+
+    def _process_single_video(self, idx: int, video_name: str, frames_path: str) -> dict | None:
+        """Process one video: frames → batches → AI → aggregation → Excel."""
+        video_start = time.time()
+
+        # 1. Discover frames
+        self.log_message.emit(f"[{video_name}] Scanning frames in: {frames_path}")
+        frames = discover_frames(frames_path)
+        if not frames:
+            self.log_message.emit(f"[{video_name}] No frames found, skipping.")
+            return None
+
+        stats = get_frame_stats(frames)
+        self.log_message.emit(
+            f"[{video_name}] Found {stats['total']} frames, "
+            f"duration {format_duration(stats['duration_seconds'])}"
+        )
+
+        # 2. Create batches
+        batches = create_batches(frames, self.batch_size)
+        total_batches = len(batches)
+        self.log_message.emit(
+            f"[{video_name}] Created {total_batches} batches (batch_size={self.batch_size})"
+        )
+
+        # 3. Create run directory
+        base = os.path.dirname(frames_path)
+        run_dir, run_id = create_run_directory(base)
+        self.log_message.emit(f"[{video_name}] Run directory: {run_dir}")
+
+        # Save config
+        config = {
+            'frame_folder': frames_path,
+            'frame_count': len(frames),
+            'batch_size': self.batch_size,
+            'total_batches': total_batches,
+            'provider': self.provider.provider_name,
+            'model': self.model,
+            'base_url': getattr(self.provider, 'base_url', ''),
+            'temperature': self.temperature,
+            'max_tokens': self.max_tokens,
+            'timeout': self.timeout,
+            'max_image_dim': self.max_image_dim,
+            'prompt': self.batch_prompt,
+        }
+        save_config(run_dir, config)
+
+        # 4. Process batches
+        batches_start = time.time()
+        successful = 0
+        failed = 0
+
+        for batch in batches:
+            if self._cancelled:
+                self.log_message.emit(f"[{video_name}] Cancelled during batch processing.")
+                return None
+
+            self.batch_progress.emit(idx, batch.batch_id, total_batches)
+            self.log_message.emit(
+                f"[{video_name}] Batch {batch.batch_id}/{total_batches} "
+                f"({len(batch.frames)} frames, {batch.time_range_str})"
+            )
+
+            try:
+                result = self._process_batch(batch, run_dir, run_id, total_batches)
+                save_batch_result(run_dir, batch.batch_id, result)
+
+                if result['processing']['status'] == 'success':
+                    successful += 1
+                    self.log_message.emit(
+                        f"[{video_name}] Batch {batch.batch_id} ✓ "
+                        f"({result['processing']['duration_seconds']:.1f}s)"
+                    )
+                else:
+                    failed += 1
+                    self.log_message.emit(
+                        f"[{video_name}] Batch {batch.batch_id} ✗ "
+                        f"{result.get('error_type', 'unknown')}"
+                    )
+            except Exception as e:
+                failed += 1
+                self.log_message.emit(
+                    f"[{video_name}] Batch {batch.batch_id} exception: {e}"
+                )
+
+        batches_duration = round(time.time() - batches_start, 2)
+        self.log_message.emit(
+            f"[{video_name}] Batches done: {successful} ok, {failed} failed, "
+            f"time={batches_duration:.1f}s"
+        )
+
+        if successful == 0:
+            self.log_message.emit(f"[{video_name}] No successful batches, skipping aggregation.")
+            return None
+
+        # 5. Run aggregation
+        self.log_message.emit(f"[{video_name}] Starting aggregation...")
+        agg_start = time.time()
+
+        batch_results = load_all_successful_batches(run_dir, total_batches)
+        full_prompt = build_aggregation_input(batch_results, self.aggregation_prompt)
+
+        raw_response = self.provider.generate_text(
+            prompt=full_prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+        )
+
+        parsed, error = safe_parse_json(raw_response)
+        if parsed is None:
+            # Retry once
+            self.log_message.emit(f"[{video_name}] Aggregation invalid JSON, retrying...")
+            retry_prompt = f"{full_prompt}\n\n{JSON_RETRY_PROMPT}"
+            raw_response = self.provider.generate_text(
+                prompt=retry_prompt,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+            )
+            parsed, error = safe_parse_json(raw_response)
+            if parsed is None:
+                self.log_message.emit(
+                    f"[{video_name}] Aggregation failed: could not parse JSON. Error: {error}"
+                )
+                return None
+
+        agg_duration = round(time.time() - agg_start, 2)
+        total_duration = round(time.time() - video_start, 2)
+
+        final_result = {
+            'run_id': run_id,
+            'source': {
+                'frame_folder': frames_path,
+                'frame_count': stats['total'],
+                'duration_seconds': stats['duration_seconds'],
+            },
+            'model': {
+                'provider': self.provider.provider_name,
+                'name': self.model,
+            },
+            'batch_config': {
+                'batch_size': self.batch_size,
+                'total_batches': total_batches,
+            },
+            'batch_results': {
+                'successful': successful,
+                'failed': failed,
+            },
+            'timing': {
+                'batches_duration_seconds': batches_duration,
+                'aggregation_duration_seconds': agg_duration,
+                'total_duration_seconds': round(batches_duration + agg_duration, 2),
+            },
+            'final_analysis': parsed,
+            'raw_response': raw_response,
+        }
+
+        save_final_result(run_dir, final_result)
+        self.log_message.emit(f"[{video_name}] Final result saved.")
+
+        # 6. Write to Excel
+        final_result_path = os.path.join(run_dir, "final_result.json")
+        summary_text = ""
+        if isinstance(parsed, dict):
+            summary_text = parsed.get('summary', '')
+            if not summary_text:
+                # Try nested final_analysis.summary
+                fa = parsed.get('final_analysis', {})
+                if isinstance(fa, dict):
+                    summary_text = fa.get('summary', '')
+
+        try:
+            append_video_result(
+                excel_path=self.excel_path,
+                video_name=video_name,
+                frame_count=stats['total'],
+                batch_size=self.batch_size,
+                total_batches=total_batches,
+                successful_batches=successful,
+                failed_batches=failed,
+                batches_duration=batches_duration,
+                aggregation_duration=agg_duration,
+                total_duration=total_duration,
+                final_result_path=final_result_path,
+                summary_text=summary_text,
+            )
+            self.log_message.emit(f"[{video_name}] Excel row written.")
+        except Exception as e:
+            self.log_message.emit(f"[{video_name}] Excel write error: {e}")
+
+        return final_result
+
+    def _process_batch(self, batch: Batch, run_dir: str, run_id: str, total_batches: int) -> dict:
+        """Process a single batch (synchronous, called from worker thread)."""
+        started_at = datetime.now()
+
+        images = []
+        for frame in batch.frames:
+            img_data = load_and_encode_image(
+                frame.filepath,
+                max_dimension=self.max_image_dim,
+            )
+            images.append(img_data)
+
+        full_prompt = build_batch_prompt(batch, self.batch_prompt)
+
+        raw_response = self.provider.analyze_images(
+            images=images,
+            prompt=full_prompt,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+        )
+
+        parsed, error = safe_parse_json(raw_response)
+
+        if parsed is None:
+            retry_prompt = f"{full_prompt}\n\n{JSON_RETRY_PROMPT}"
+            try:
+                raw_response_retry = self.provider.analyze_images(
+                    images=images,
+                    prompt=retry_prompt,
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    timeout=self.timeout,
+                )
+                parsed, error = safe_parse_json(raw_response_retry)
+                if parsed is None:
+                    finished_at = datetime.now()
+                    return {
+                        'run_id': run_id,
+                        'batch_id': batch.batch_id,
+                        'total_batches': total_batches,
+                        'frames': [
+                            {'filename': f.filename, 'timestamp_seconds': f.timestamp_seconds}
+                            for f in batch.frames
+                        ],
+                        'provider': self.provider.provider_name,
+                        'model': self.model,
+                        'prompt': self.batch_prompt,
+                        'raw_response': raw_response_retry,
+                        'processing': {
+                            'started_at': started_at.isoformat(),
+                            'finished_at': finished_at.isoformat(),
+                            'duration_seconds': round(
+                                (finished_at - started_at).total_seconds(), 2
+                            ),
+                            'status': 'failed',
+                        },
+                        'error_type': 'invalid_json',
+                        'retry_attempted': True,
+                    }
+                raw_response = raw_response_retry
+            except Exception as retry_err:
+                finished_at = datetime.now()
+                return {
+                    'run_id': run_id,
+                    'batch_id': batch.batch_id,
+                    'total_batches': total_batches,
+                    'frames': [
+                        {'filename': f.filename, 'timestamp_seconds': f.timestamp_seconds}
+                        for f in batch.frames
+                    ],
+                    'provider': self.provider.provider_name,
+                    'model': self.model,
+                    'prompt': self.batch_prompt,
+                    'raw_response': raw_response,
+                    'processing': {
+                        'started_at': started_at.isoformat(),
+                        'finished_at': finished_at.isoformat(),
+                        'duration_seconds': round(
+                            (finished_at - started_at).total_seconds(), 2
+                        ),
+                        'status': 'failed',
+                    },
+                    'error_type': f'retry_failed: {retry_err}',
+                    'retry_attempted': True,
+                }
+
+        finished_at = datetime.now()
+        return {
+            'run_id': run_id,
+            'batch_id': batch.batch_id,
+            'total_batches': total_batches,
+            'frames': [
+                {'filename': f.filename, 'timestamp_seconds': f.timestamp_seconds}
+                for f in batch.frames
+            ],
+            'provider': self.provider.provider_name,
+            'model': self.model,
+            'prompt': self.batch_prompt,
+            'result': parsed,
+            'raw_response': raw_response,
+            'processing': {
+                'started_at': started_at.isoformat(),
+                'finished_at': finished_at.isoformat(),
+                'duration_seconds': round(
+                    (finished_at - started_at).total_seconds(), 2
+                ),
+                'status': 'success',
+            },
+        }
+
 
 # ===================================================================
 # Main Window
@@ -499,6 +910,12 @@ class MainWindow(QMainWindow):
         self._agg_thread: QThread | None = None
         self._agg_worker: AggregationWorker | None = None
 
+        # Multi-video state
+        self._multi_thread: QThread | None = None
+        self._multi_worker: MultiVideoWorker | None = None
+        self._multi_video_folders: list[dict] = []
+        self._multi_excel_path: str = ""
+
         # Timing state
         self._batches_duration: float | None = None
         self._batches_start_time: float | None = None
@@ -507,6 +924,9 @@ class MainWindow(QMainWindow):
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(500)
         self._live_timer.timeout.connect(self._on_live_timer_tick)
+
+        # Multi-video timing
+        self._multi_start_time: float | None = None
 
         self._setup_ui()
         self._connect_signals()
@@ -519,7 +939,35 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(6)
 
-        # --- Frame Folder ---
+        # === Mode Switch ===
+        mode_group = QGroupBox("Processing Mode")
+        mode_layout = QHBoxLayout(mode_group)
+        mode_layout.setContentsMargins(10, 6, 10, 6)
+
+        self.btn_mode_single = QPushButton("📄 Single File")
+        self.btn_mode_multi = QPushButton("📁 Multi File")
+
+        for btn in (self.btn_mode_single, self.btn_mode_multi):
+            btn.setCheckable(True)
+            btn.setFixedHeight(32)
+            btn.setMinimumWidth(140)
+
+        self.btn_mode_single.setChecked(True)
+        self._apply_mode_button_styles()
+
+        mode_layout.addWidget(self.btn_mode_single)
+        mode_layout.addWidget(self.btn_mode_multi)
+        mode_layout.addStretch()
+        main_layout.addWidget(mode_group)
+
+        # === Stacked Widget for Mode-Specific Input ===
+        self._input_stack = QStackedWidget()
+
+        # --- Page 0: Single File Input ---
+        single_page = QWidget()
+        single_layout = QVBoxLayout(single_page)
+        single_layout.setContentsMargins(0, 0, 0, 0)
+
         frame_group = QGroupBox("Frame Folder")
         frame_layout = QVBoxLayout(frame_group)
 
@@ -546,7 +994,51 @@ class MainWindow(QMainWindow):
         info_grid.addWidget(self.lbl_avg_interval, 1, 1)
         frame_layout.addLayout(info_grid)
 
-        main_layout.addWidget(frame_group)
+        single_layout.addWidget(frame_group)
+        self._input_stack.addWidget(single_page)
+
+        # --- Page 1: Multi File Input ---
+        multi_page = QWidget()
+        multi_layout = QVBoxLayout(multi_page)
+        multi_layout.setContentsMargins(0, 0, 0, 0)
+
+        multi_group = QGroupBox("Multi-Video Folder")
+        multi_group_layout = QVBoxLayout(multi_group)
+
+        # Root folder selection
+        multi_row1 = QHBoxLayout()
+        self.btn_select_multi_folder = QPushButton("Select Root Folder")
+        self.btn_select_multi_folder.setFixedWidth(160)
+        self.lbl_multi_folder_path = QLabel("No folder selected")
+        self.lbl_multi_folder_path.setWordWrap(True)
+        multi_row1.addWidget(self.btn_select_multi_folder)
+        multi_row1.addWidget(self.lbl_multi_folder_path, 1)
+        multi_group_layout.addLayout(multi_row1)
+
+        # Excel file selection
+        multi_row2 = QHBoxLayout()
+        self.btn_select_excel = QPushButton("Select Excel File")
+        self.btn_select_excel.setFixedWidth(160)
+        self.lbl_excel_path = QLabel("No Excel file selected")
+        self.lbl_excel_path.setWordWrap(True)
+        multi_row2.addWidget(self.btn_select_excel)
+        multi_row2.addWidget(self.lbl_excel_path, 1)
+        multi_group_layout.addLayout(multi_row2)
+
+        # Discovered videos info
+        self.lbl_multi_info = QLabel("Videos found: —")
+        self.lbl_multi_info.setWordWrap(True)
+        multi_group_layout.addWidget(self.lbl_multi_info)
+
+        # Video list
+        self.list_multi_videos = QListWidget()
+        self.list_multi_videos.setMaximumHeight(120)
+        multi_group_layout.addWidget(self.list_multi_videos)
+
+        multi_layout.addWidget(multi_group)
+        self._input_stack.addWidget(multi_page)
+
+        main_layout.addWidget(self._input_stack)
 
         # --- Middle Splitter: Config | Progress ---
         splitter = QSplitter(Qt.Horizontal)
@@ -637,7 +1129,7 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(params_group)
 
-        # Run Selection
+        # Run Selection (only for single-file mode, but kept visible)
         run_group = QGroupBox("Run Selection (for Resume)")
         run_layout = QHBoxLayout(run_group)
         self.combo_runs = QComboBox()
@@ -646,6 +1138,7 @@ class MainWindow(QMainWindow):
         self.btn_refresh_runs.setFixedWidth(70)
         run_layout.addWidget(self.combo_runs, 1)
         run_layout.addWidget(self.btn_refresh_runs)
+        self._run_group = run_group
         left_layout.addWidget(run_group)
 
         left_layout.addStretch()
@@ -760,6 +1253,8 @@ class MainWindow(QMainWindow):
 
         # --- Action Buttons ---
         btn_layout = QHBoxLayout()
+
+        # Single-file buttons
         self.btn_send_all = QPushButton("Send All")
         self.btn_resume = QPushButton("Resume")
         self.btn_force_rerun = QPushButton("Force Re-run")
@@ -768,6 +1263,19 @@ class MainWindow(QMainWindow):
         self.btn_aggregate = QPushButton("Generate Final Analysis")
         self.btn_aggregate.setEnabled(False)
 
+        # Multi-file buttons
+        self.btn_multi_start = QPushButton("▶ Start Multi Processing")
+        self.btn_multi_start.setStyleSheet(
+            "QPushButton { background-color: #27ae60; color: white; font-weight: bold; padding: 6px 16px; }"
+            "QPushButton:hover { background-color: #2ecc71; }"
+            "QPushButton:disabled { background-color: #95a5a6; }"
+        )
+        self.btn_multi_cancel = QPushButton("Cancel")
+        self.btn_multi_cancel.setEnabled(False)
+        self.btn_multi_open_excel = QPushButton("Open Excel")
+        self.btn_multi_open_excel.setEnabled(False)
+
+        # Single-file action buttons
         btn_layout.addWidget(self.btn_send_all)
         btn_layout.addWidget(self.btn_resume)
         btn_layout.addWidget(self.btn_force_rerun)
@@ -775,11 +1283,71 @@ class MainWindow(QMainWindow):
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_aggregate)
 
+        # Multi-file action buttons
+        btn_layout.addWidget(self.btn_multi_start)
+        btn_layout.addWidget(self.btn_multi_cancel)
+        btn_layout.addWidget(self.btn_multi_open_excel)
+
         main_layout.addLayout(btn_layout)
+
+        # Initialize mode visibility
+        self._set_mode('single')
+
+    def _apply_mode_button_styles(self):
+        """Apply visual styles to mode toggle buttons."""
+        active_style = (
+            "QPushButton { background-color: #2980b9; color: white; "
+            "font-weight: bold; border-radius: 4px; padding: 4px 16px; }"
+        )
+        inactive_style = (
+            "QPushButton { background-color: #ecf0f1; color: #2c3e50; "
+            "border: 1px solid #bdc3c7; border-radius: 4px; padding: 4px 16px; }"
+            "QPushButton:hover { background-color: #d5dbdb; }"
+        )
+        self.btn_mode_single.setStyleSheet(
+            active_style if self.btn_mode_single.isChecked() else inactive_style
+        )
+        self.btn_mode_multi.setStyleSheet(
+            active_style if self.btn_mode_multi.isChecked() else inactive_style
+        )
+
+    def _set_mode(self, mode: str):
+        """Switch between 'single' and 'multi' mode."""
+        is_single = (mode == 'single')
+
+        self.btn_mode_single.setChecked(is_single)
+        self.btn_mode_multi.setChecked(not is_single)
+        self._apply_mode_button_styles()
+
+        self._input_stack.setCurrentIndex(0 if is_single else 1)
+
+        # Show/hide appropriate action buttons
+        self.btn_send_all.setVisible(is_single)
+        self.btn_resume.setVisible(is_single)
+        self.btn_force_rerun.setVisible(is_single)
+        self.btn_cancel.setVisible(is_single)
+        self.btn_aggregate.setVisible(is_single)
+
+        self.btn_multi_start.setVisible(not is_single)
+        self.btn_multi_cancel.setVisible(not is_single)
+        self.btn_multi_open_excel.setVisible(not is_single)
+
+        # Run Selection is only for single-file mode
+        self._run_group.setVisible(is_single)
+
+        # Corner widget items for final result (single mode only)
+        self.btn_view_final_result.setVisible(is_single)
+        self.btn_open_run_folder.setVisible(is_single)
+        self.lbl_final_result_status.setVisible(is_single)
 
     # ----- Signal Connections -----
 
     def _connect_signals(self):
+        # Mode switch
+        self.btn_mode_single.clicked.connect(lambda: self._set_mode('single'))
+        self.btn_mode_multi.clicked.connect(lambda: self._set_mode('multi'))
+
+        # Single-file signals
         self.btn_select_folder.clicked.connect(self._select_folder)
         self.spin_batch_size.valueChanged.connect(self._update_batch_info)
         self.combo_provider.currentIndexChanged.connect(self._on_provider_changed)
@@ -793,6 +1361,13 @@ class MainWindow(QMainWindow):
         self.btn_aggregate.clicked.connect(self._start_aggregation)
         self.btn_view_final_result.clicked.connect(self._show_final_result_dialog)
         self.btn_open_run_folder.clicked.connect(self._open_current_run_folder)
+
+        # Multi-file signals
+        self.btn_select_multi_folder.clicked.connect(self._select_multi_folder)
+        self.btn_select_excel.clicked.connect(self._select_excel_file)
+        self.btn_multi_start.clicked.connect(self._start_multi_processing)
+        self.btn_multi_cancel.clicked.connect(self._cancel_multi_processing)
+        self.btn_multi_open_excel.clicked.connect(self._open_excel_file)
 
     # ----- Folder Selection -----
 
@@ -1050,6 +1625,10 @@ class MainWindow(QMainWindow):
         elif self._agg_start_time is not None:
             self._agg_duration = time.time() - self._agg_start_time
             self._update_timing_display(agg_running=True)
+        elif self._multi_start_time is not None:
+            # Multi-video mode: just update the total time label
+            elapsed = time.time() - self._multi_start_time
+            self.lbl_total_time.setText(f"Total Time: {self._format_time_sec(elapsed, is_running=True)}")
 
     def _format_time_sec(self, seconds: float | None, is_running: bool = False) -> str:
         if seconds is None:
@@ -1443,6 +2022,360 @@ class MainWindow(QMainWindow):
         self.lbl_final_result_status.setText("✗ final_result.json: Failed")
         self.lbl_final_result_status.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 11px;")
         QMessageBox.warning(self, "Aggregation Failed", error)
+
+    # ===================================================================
+    # Multi-File Mode
+    # ===================================================================
+
+    def _select_multi_folder(self):
+        """Select root folder containing video subfolders with frames."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Root Folder (contains video subfolders)"
+        )
+        if not folder:
+            return
+
+        self.lbl_multi_folder_path.setText(folder)
+        self._log(f"[Multi] Selected root folder: {folder}")
+
+        # Scan for video subfolders with "frames" directories
+        self._multi_video_folders = []
+        self.list_multi_videos.clear()
+
+        try:
+            for entry in sorted(os.listdir(folder)):
+                sub_path = os.path.join(folder, entry)
+                if not os.path.isdir(sub_path):
+                    continue
+
+                frames_path = os.path.join(sub_path, "frames")
+                if os.path.isdir(frames_path):
+                    # Check if frames folder actually has image files
+                    try:
+                        frames = discover_frames(frames_path)
+                        frame_count = len(frames)
+                    except Exception:
+                        frame_count = 0
+
+                    if frame_count > 0:
+                        self._multi_video_folders.append({
+                            'name': entry,
+                            'frames_path': frames_path,
+                            'frame_count': frame_count,
+                        })
+                        item = QListWidgetItem(
+                            f"📹 {entry}  ({frame_count} frames)"
+                        )
+                        self.list_multi_videos.addItem(item)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to scan folder:\n{e}")
+            return
+
+        count = len(self._multi_video_folders)
+        total_frames = sum(vf['frame_count'] for vf in self._multi_video_folders)
+        self.lbl_multi_info.setText(
+            f"Videos found: {count}  |  Total frames across all videos: {total_frames}"
+        )
+        self._log(f"[Multi] Found {count} video folder(s) with {total_frames} total frames")
+
+        if count == 0:
+            QMessageBox.information(
+                self, "No Videos Found",
+                "No video subfolders with 'frames' directory found.\n\n"
+                "Expected structure:\n"
+                "  <selected folder>/\n"
+                "    <video_name_1>/frames/\n"
+                "    <video_name_2>/frames/\n"
+                "    ..."
+            )
+
+    def _select_excel_file(self):
+        """Select or create an Excel file for multi-video results."""
+        if not HAS_OPENPYXL:
+            QMessageBox.warning(
+                self, "Missing Dependency",
+                "openpyxl is required for Excel export.\n"
+                "Install it with: pip install openpyxl"
+            )
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select Excel File for Results",
+            os.path.expanduser("~/multi_video_results.xlsx"),
+            "Excel Files (*.xlsx);;All Files (*)",
+        )
+        if not path:
+            return
+
+        if not path.endswith('.xlsx'):
+            path += '.xlsx'
+
+        self._multi_excel_path = path
+        self.lbl_excel_path.setText(path)
+        self._log(f"[Multi] Excel file: {path}")
+
+        # Pre-create the workbook if it doesn't exist
+        try:
+            create_or_load_workbook(path)
+            self._log(f"[Multi] Excel file ready.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to create/open Excel file:\n{e}")
+
+    def _start_multi_processing(self):
+        """Start processing all discovered video folders."""
+        if not self._multi_video_folders:
+            QMessageBox.warning(
+                self, "Error",
+                "No video folders loaded. Select a root folder first."
+            )
+            return
+
+        if not self._multi_excel_path:
+            QMessageBox.warning(
+                self, "Error",
+                "No Excel file selected. Please select an Excel file for results."
+            )
+            return
+
+        model_name = self.combo_model.currentText().strip()
+        if not model_name:
+            QMessageBox.warning(self, "Error", "No model selected.")
+            return
+
+        try:
+            provider = self._get_provider()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Provider error:\n{e}")
+            return
+
+        max_dim = self.spin_max_image_dim.value()
+        if max_dim == 0:
+            max_dim = None
+
+        total_videos = len(self._multi_video_folders)
+
+        # Confirm
+        reply = QMessageBox.question(
+            self, "Start Multi-Video Processing",
+            f"Process {total_videos} video(s) with the following config?\n\n"
+            f"  Model: {model_name}\n"
+            f"  Batch size: {self.spin_batch_size.value()}\n"
+            f"  Temperature: {self.spin_temperature.value()}\n"
+            f"  Excel: {self._multi_excel_path}\n\n"
+            f"This may take a long time.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Prepare progress UI
+        self.batch_list.clear()
+        self._multi_video_items: dict[int, QListWidgetItem] = {}
+        for idx, vf in enumerate(self._multi_video_folders):
+            item = QListWidgetItem(
+                f"○ [{idx+1}/{total_videos}] {vf['name']} — Pending ({vf['frame_count']} frames)"
+            )
+            item.setForeground(Qt.gray)
+            self.batch_list.addItem(item)
+            self._multi_video_items[idx] = item
+
+        self.progress_bar.setRange(0, total_videos)
+        self.progress_bar.setValue(0)
+        self.lbl_progress_status.setText(f"Multi-video: 0/{total_videos}")
+        self.lbl_successful.setText("Completed: 0")
+        self.lbl_failed.setText("Failed: 0")
+        self.lbl_pending.setText(f"Pending: {total_videos}")
+
+        # Timing
+        self._multi_start_time = time.time()
+        self._batches_duration = None
+        self._agg_duration = None
+        self.lbl_batches_time.setText("Batches Time: —")
+        self.lbl_agg_time.setText("Final Analysis Time: —")
+        self.lbl_total_time.setText("Total Time: 0.0s (running...)")
+        self.lbl_prompt_timing.setText("⏱ Multi-video processing...")
+        self._live_timer.start()
+
+        # Create multi-video worker
+        self._multi_worker = MultiVideoWorker(
+            video_folders=self._multi_video_folders,
+            provider=provider,
+            model=model_name,
+            batch_prompt=self.txt_batch_prompt.toPlainText(),
+            aggregation_prompt=self.txt_agg_prompt.toPlainText(),
+            batch_size=self.spin_batch_size.value(),
+            temperature=self.spin_temperature.value(),
+            max_tokens=self.spin_max_tokens.value(),
+            timeout=self.spin_timeout.value(),
+            max_image_dim=max_dim,
+            excel_path=self._multi_excel_path,
+        )
+        self._multi_thread = QThread()
+        self._multi_worker.moveToThread(self._multi_thread)
+
+        self._multi_thread.started.connect(self._multi_worker.run)
+        self._multi_worker.video_started.connect(self._on_multi_video_started)
+        self._multi_worker.video_completed.connect(self._on_multi_video_completed)
+        self._multi_worker.video_failed.connect(self._on_multi_video_failed)
+        self._multi_worker.batch_progress.connect(self._on_multi_batch_progress)
+        self._multi_worker.all_videos_completed.connect(self._on_multi_all_completed)
+        self._multi_worker.log_message.connect(self._log)
+        self._multi_worker.all_videos_completed.connect(self._multi_thread.quit)
+
+        # Disable UI
+        self._set_multi_processing_ui(True)
+        self._multi_thread.start()
+
+    def _set_multi_processing_ui(self, processing: bool):
+        """Enable/disable UI elements during multi-video processing."""
+        self.btn_multi_start.setEnabled(not processing)
+        self.btn_multi_cancel.setEnabled(processing)
+        self.btn_select_multi_folder.setEnabled(not processing)
+        self.btn_select_excel.setEnabled(not processing)
+        self.btn_mode_single.setEnabled(not processing)
+        self.btn_mode_multi.setEnabled(not processing)
+
+        # Also disable shared config during processing
+        self.spin_batch_size.setEnabled(not processing)
+        self.combo_provider.setEnabled(not processing)
+        self.edit_base_url.setEnabled(not processing)
+        self.combo_model.setEnabled(not processing)
+        self.btn_refresh_models.setEnabled(not processing)
+        self.spin_temperature.setEnabled(not processing)
+        self.spin_max_tokens.setEnabled(not processing)
+        self.spin_timeout.setEnabled(not processing)
+        self.spin_concurrency.setEnabled(not processing)
+        self.spin_max_image_dim.setEnabled(not processing)
+
+    def _on_multi_video_started(self, idx: int, video_name: str):
+        item = self._multi_video_items.get(idx)
+        if item:
+            total = len(self._multi_video_folders)
+            item.setText(f"● [{idx+1}/{total}] {video_name} — Processing...")
+            item.setForeground(Qt.blue)
+            self.batch_list.scrollToItem(item)
+
+        self.lbl_progress_status.setText(
+            f"Multi-video: Processing [{idx+1}/{len(self._multi_video_folders)}] {video_name}"
+        )
+
+    def _on_multi_batch_progress(self, video_idx: int, batch_id: int, total_batches: int):
+        """Update the video item text to show current batch progress."""
+        item = self._multi_video_items.get(video_idx)
+        if item:
+            video_name = self._multi_video_folders[video_idx]['name']
+            total = len(self._multi_video_folders)
+            item.setText(
+                f"● [{video_idx+1}/{total}] {video_name} — Batch {batch_id}/{total_batches}"
+            )
+
+    def _on_multi_video_completed(self, idx: int, video_name: str, result: dict):
+        item = self._multi_video_items.get(idx)
+        total = len(self._multi_video_folders)
+
+        timing = result.get('timing', {})
+        total_dur = timing.get('total_duration_seconds', 0)
+
+        if item:
+            item.setText(
+                f"✓ [{idx+1}/{total}] {video_name} — Done ({total_dur:.1f}s)"
+            )
+            item.setForeground(Qt.darkGreen)
+
+        completed = sum(
+            1 for i in range(total)
+            if self._multi_video_items.get(i) and
+            self._multi_video_items[i].text().startswith("✓")
+        )
+        failed = sum(
+            1 for i in range(total)
+            if self._multi_video_items.get(i) and
+            self._multi_video_items[i].text().startswith("✗")
+        )
+        pending = total - completed - failed
+
+        self.progress_bar.setValue(completed + failed)
+        self.lbl_successful.setText(f"Completed: {completed}")
+        self.lbl_failed.setText(f"Failed: {failed}")
+        self.lbl_pending.setText(f"Pending: {pending}")
+
+    def _on_multi_video_failed(self, idx: int, video_name: str, error: str):
+        item = self._multi_video_items.get(idx)
+        total = len(self._multi_video_folders)
+
+        if item:
+            short_err = error[:60] + "..." if len(error) > 60 else error
+            item.setText(
+                f"✗ [{idx+1}/{total}] {video_name} — Failed: {short_err}"
+            )
+            item.setForeground(Qt.red)
+
+        completed = sum(
+            1 for i in range(total)
+            if self._multi_video_items.get(i) and
+            self._multi_video_items[i].text().startswith("✓")
+        )
+        failed = sum(
+            1 for i in range(total)
+            if self._multi_video_items.get(i) and
+            self._multi_video_items[i].text().startswith("✗")
+        )
+        pending = total - completed - failed
+
+        self.progress_bar.setValue(completed + failed)
+        self.lbl_successful.setText(f"Completed: {completed}")
+        self.lbl_failed.setText(f"Failed: {failed}")
+        self.lbl_pending.setText(f"Pending: {pending}")
+
+    def _on_multi_all_completed(self, summary: dict):
+        self._live_timer.stop()
+
+        total_dur = summary.get('total_duration', 0)
+        self._multi_start_time = None
+
+        self._set_multi_processing_ui(False)
+        self.btn_multi_open_excel.setEnabled(True)
+
+        cancelled = summary.get('cancelled', False)
+        status = "cancelled" if cancelled else "completed"
+        self.lbl_progress_status.setText(
+            f"Multi-video {status}: "
+            f"{summary['completed']} completed, "
+            f"{summary['failed']} failed"
+        )
+        self.lbl_total_time.setText(f"Total Time: {self._format_time_sec(total_dur)}")
+        self.lbl_prompt_timing.setText(
+            f"⏱ Multi-video {status} | Total: {self._format_time_sec(total_dur)}"
+        )
+
+        self._log(
+            f"Multi-video {status}: "
+            f"{summary['completed']}/{summary['total']} completed, "
+            f"{summary['failed']} failed, "
+            f"total time: {self._format_time_sec(total_dur)}"
+        )
+
+        if not cancelled:
+            QMessageBox.information(
+                self, "Multi-Video Complete",
+                f"Processing completed!\n\n"
+                f"  Videos processed: {summary['completed']}/{summary['total']}\n"
+                f"  Failed: {summary['failed']}\n"
+                f"  Total time: {self._format_time_sec(total_dur)}\n\n"
+                f"Results saved to:\n{self._multi_excel_path}"
+            )
+
+    def _cancel_multi_processing(self):
+        if self._multi_worker:
+            self._multi_worker.cancel()
+            self._log("[Multi] Cancel requested — waiting for current video to finish...")
+            self.btn_multi_cancel.setEnabled(False)
+
+    def _open_excel_file(self):
+        if self._multi_excel_path and os.path.exists(self._multi_excel_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._multi_excel_path))
 
     # ----- Logging -----
 
