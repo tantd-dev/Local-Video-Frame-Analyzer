@@ -44,15 +44,10 @@ from utils.timestamp import format_duration
 # ---------------------------------------------------------------------------
 
 DEFAULT_BATCH_PROMPT = """You are analyzing sequential frames extracted from the same video.
-
 The frames are ordered chronologically.
-
 Analyze the visual content represented by these frames.
-
 Return ONLY valid JSON.
-
 Use this structure:
-
 {
   "summary": "",
   "scenes": [],
