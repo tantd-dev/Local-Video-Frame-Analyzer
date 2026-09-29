@@ -32,7 +32,13 @@ from core.result_manager import (
 from core.aggregation import (
     DEFAULT_AGGREGATION_PROMPT, build_aggregation_input, estimate_token_count,
 )
-from core.excel_reporter import append_video_result, create_or_load_workbook, HAS_OPENPYXL
+from core.excel_reporter import (
+    append_video_result,
+    check_excel_file_writable,
+    create_or_load_workbook,
+    save_workbook_safe,
+    HAS_OPENPYXL,
+)
 from providers.base import AIProvider
 from providers.lmstudio import LMStudioProvider
 from providers.ollama import OllamaProvider
@@ -529,6 +535,9 @@ class MultiVideoWorker(QObject):
         self.max_image_dim = max_image_dim
         self.excel_path = excel_path
         self._cancelled = False
+        self._wb = None
+        self._ws = None
+        self._fallback_excel_path = None
 
     def cancel(self):
         self._cancelled = True
@@ -539,6 +548,13 @@ class MultiVideoWorker(QObject):
         completed_count = 0
         failed_count = 0
         overall_start = time.time()
+
+        # Pre-initialize or load Excel workbook
+        if HAS_OPENPYXL and self.excel_path:
+            try:
+                self._wb, self._ws = create_or_load_workbook(self.excel_path)
+            except Exception as e:
+                self.log_message.emit(f"Initial Excel check warning: {e}")
 
         for idx, vf in enumerate(self.video_folders):
             if self._cancelled:
@@ -572,6 +588,20 @@ class MultiVideoWorker(QObject):
                 )
                 self.video_failed.emit(idx, video_name, error_msg)
 
+        # If any fallback occurred, attempt a final sync to main file
+        if self._fallback_excel_path and self._wb and self.excel_path:
+            self.log_message.emit(f"[Excel] Đang đồng bộ kết quả cuối cùng vào file chính: {self.excel_path}...")
+            sync_ok, sync_path, _ = save_workbook_safe(
+                self._wb, self.excel_path, max_retries=1, retry_delay=0.5
+            )
+            if sync_ok and os.path.abspath(sync_path) == os.path.abspath(self.excel_path):
+                self.log_message.emit(f"[Excel] ✅ Đồng bộ thành công vào: {self.excel_path}")
+                self._fallback_excel_path = None
+            else:
+                self.log_message.emit(
+                    f"[Excel] ⚠️ File chính vẫn đang mở trong Excel. Kết quả đầy đủ nằm tại: {self._fallback_excel_path}"
+                )
+
         overall_duration = round(time.time() - overall_start, 2)
         summary = {
             'total': total_videos,
@@ -579,6 +609,8 @@ class MultiVideoWorker(QObject):
             'failed': failed_count,
             'cancelled': self._cancelled,
             'total_duration': overall_duration,
+            'excel_path': self.excel_path,
+            'fallback_excel_path': self._fallback_excel_path,
         }
         self.all_videos_completed.emit(summary)
 
@@ -756,7 +788,7 @@ class MultiVideoWorker(QObject):
                     summary_text = fa.get('summary', '')
 
         try:
-            append_video_result(
+            res = append_video_result(
                 excel_path=self.excel_path,
                 video_name=video_name,
                 frame_count=stats['total'],
@@ -769,8 +801,20 @@ class MultiVideoWorker(QObject):
                 total_duration=total_duration,
                 final_result_path=final_result_path,
                 summary_text=summary_text,
+                wb=self._wb,
+                ws=self._ws,
+                log_fn=lambda msg: self.log_message.emit(f"[{video_name}] {msg}"),
             )
-            self.log_message.emit(f"[{video_name}] Excel row written.")
+            self._wb = res['workbook']
+            self._ws = res['worksheet']
+            if res.get('is_fallback'):
+                self._fallback_excel_path = res['saved_path']
+                self.log_message.emit(
+                    f"[{video_name}] ⚠️ Đã lưu dòng Excel vào file dự phòng: {res['saved_path']}\n"
+                    f"  (Do file chính đang bị khóa. Hãy đóng Excel để tự động đồng bộ!)"
+                )
+            else:
+                self.log_message.emit(f"[{video_name}] Excel row written to: {res['saved_path']}")
         except Exception as e:
             self.log_message.emit(f"[{video_name}] Excel write error: {e}")
 
@@ -2111,6 +2155,16 @@ class MainWindow(QMainWindow):
         if not path.endswith('.xlsx'):
             path += '.xlsx'
 
+        # Check if the file is writable / locked
+        is_writable, err_msg = check_excel_file_writable(path)
+        if not is_writable:
+            QMessageBox.warning(
+                self, "Excel File Locked / Permission Denied",
+                f"Không thể chọn tệp Excel này:\n\n{err_msg}\n\n"
+                f"Vui lòng đóng file Excel nếu đang mở hoặc chọn vị trí khác."
+            )
+            return
+
         self._multi_excel_path = path
         self.lbl_excel_path.setText(path)
         self._log(f"[Multi] Excel file: {path}")
@@ -2135,6 +2189,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Error",
                 "No Excel file selected. Please select an Excel file for results."
+            )
+            return
+
+        # Validate that Excel file is not locked before starting batches
+        is_writable, err_msg = check_excel_file_writable(self._multi_excel_path)
+        if not is_writable:
+            QMessageBox.warning(
+                self, "Excel File Locked",
+                f"Tệp Excel kết quả hiện không thể ghi được:\n{self._multi_excel_path}\n\n"
+                f"{err_msg}\n\n"
+                f"Vui lòng đóng file trong Microsoft Excel rồi nhấn Bắt đầu lại."
             )
             return
 
@@ -2357,14 +2422,24 @@ class MainWindow(QMainWindow):
             f"total time: {self._format_time_sec(total_dur)}"
         )
 
+        self._multi_last_fallback = summary.get('fallback_excel_path')
+
         if not cancelled:
+            saved_info = f"Results saved to:\n{self._multi_excel_path}"
+            if self._multi_last_fallback:
+                saved_info = (
+                    f"⚠️ File chính bị khóa trong lúc xử lý, kết quả đã được lưu dự phòng vào:\n"
+                    f"{self._multi_last_fallback}\n\n"
+                    f"Đường dẫn file chính:\n{self._multi_excel_path}"
+                )
+
             QMessageBox.information(
                 self, "Multi-Video Complete",
                 f"Processing completed!\n\n"
                 f"  Videos processed: {summary['completed']}/{summary['total']}\n"
                 f"  Failed: {summary['failed']}\n"
                 f"  Total time: {self._format_time_sec(total_dur)}\n\n"
-                f"Results saved to:\n{self._multi_excel_path}"
+                f"{saved_info}"
             )
 
     def _cancel_multi_processing(self):
@@ -2374,8 +2449,12 @@ class MainWindow(QMainWindow):
             self.btn_multi_cancel.setEnabled(False)
 
     def _open_excel_file(self):
-        if self._multi_excel_path and os.path.exists(self._multi_excel_path):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self._multi_excel_path))
+        target = self._multi_excel_path
+        if hasattr(self, '_multi_last_fallback') and self._multi_last_fallback and os.path.exists(self._multi_last_fallback):
+            if not target or not os.path.exists(target):
+                target = self._multi_last_fallback
+        if target and os.path.exists(target):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     # ----- Logging -----
 
