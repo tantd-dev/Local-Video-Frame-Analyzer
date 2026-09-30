@@ -137,6 +137,54 @@ def test_json_extraction():
     assert parsed is None
     assert err is not None
 
+    # --- Conversational wrapping (the exact problematic pattern) ---
+    j5 = (
+        "Ok, I'm ready to analyze the video frames:\n\n"
+        "```json\n"
+        '{\n  "summary": "A person walks across the room",\n'
+        '  "scenes": ["indoor scene"]\n'
+        "}\n"
+        "```\n\n"
+        "I'm ready for my next instruction."
+    )
+    parsed, err = safe_parse_json(j5)
+    assert parsed is not None, f"Failed to parse conversational wrapping: {err}"
+    assert parsed["summary"] == "A person walks across the room"
+
+    # --- Multiple fenced blocks (first valid JSON wins) ---
+    j6 = (
+        "Here is some pseudo-code:\n"
+        "```\nfor x in range(10):\n    print(x)\n```\n\n"
+        "And here is the analysis:\n"
+        '```json\n{"summary": "multi-block test"}\n```'
+    )
+    parsed, err = safe_parse_json(j6)
+    assert parsed is not None, f"Failed multi-block extraction: {err}"
+    assert parsed["summary"] == "multi-block test"
+
+    # --- JSON array response ---
+    j7 = 'The results:\n[{"id": 1}, {"id": 2}]'
+    extracted = extract_json_from_text(j7)
+    assert extracted is not None
+    assert json.loads(extracted) == [{"id": 1}, {"id": 2}]
+
+    # --- Inline fence (no newline after ```json) ---
+    j8 = '```json{"summary": "inline"}```'
+    parsed, err = safe_parse_json(j8)
+    assert parsed is not None, f"Failed inline fence: {err}"
+    assert parsed["summary"] == "inline"
+
+    # --- Fence with extra braces in surrounding text ---
+    j9 = (
+        "The function signature is func() { ... }\n"
+        "Result:\n"
+        '```json\n{"summary": "braces outside"}\n```\n'
+        "End of response (see { docs } for more)."
+    )
+    parsed, err = safe_parse_json(j9)
+    assert parsed is not None, f"Failed braces-outside test: {err}"
+    assert parsed["summary"] == "braces outside"
+
     print("  ✓ JSON extraction & parsing")
 
 

@@ -161,55 +161,134 @@ def repair_duplicated_text(text: str) -> str:
     return text
 
 
+def _extract_from_fences(text: str) -> str | None:
+    """Extract JSON from markdown code fences.
+
+    Tries multiple fence patterns with flexible whitespace handling.
+    Prefers ```json fences over bare ``` fences.  Within each fence
+    type, returns the first block that parses as valid JSON.
+    """
+    # Patterns ordered by specificity: ```json first, then bare ```.
+    # Each pattern allows optional whitespace (including no newline)
+    # between the fence marker and the content, and allows the
+    # closing ``` to appear on the same line or after whitespace.
+    fence_patterns = [
+        r'```json\s*([\s\S]*?)\s*```',      # ```json ... ```
+        r'```\s*([\s\S]*?)\s*```',           # ``` ... ```
+    ]
+    for pattern in fence_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL):
+            candidate = match.group(1).strip()
+            if not candidate:
+                continue
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                # This fence block didn't contain valid JSON;
+                # try the next match for this pattern.
+                continue
+    return None
+
+
+def _extract_by_brace_depth(text: str) -> str | None:
+    """Find the first complete JSON object or array via brace/bracket depth tracking.
+
+    Scans through the text character-by-character, tracking brace ``{}``
+    and bracket ``[]`` depth while respecting JSON string literals
+    (skipping escaped characters inside strings).  Returns the first
+    balanced span that parses as valid JSON.
+
+    This is more reliable than ``text[text.find('{'):text.rfind('}')+1]``
+    because it correctly handles JSON embedded between other text that
+    may also contain braces.
+    """
+    # Find all positions where a JSON value could start
+    openers = []
+    for i, ch in enumerate(text):
+        if ch in ('{', '['):
+            openers.append(i)
+
+    for start in openers:
+        open_char = text[start]
+        close_char = '}' if open_char == '{' else ']'
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start, len(text)):
+            ch = text[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if in_string:
+                if ch == '\\':
+                    escape_next = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == open_char:
+                depth += 1
+            elif ch == close_char:
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        break  # This opener failed; try the next one.
+
+    return None
+
+
 def extract_json_from_text(text: str) -> str | None:
     """Try to extract a JSON object from text that may contain extra content.
 
     Handles:
     - Pure JSON
-    - JSON wrapped in ```json ... ``` fences
-    - JSON wrapped in ``` ... ``` fences
-    - JSON embedded in surrounding text
+    - JSON wrapped in ```json ... ``` or ``` ... ``` fences
+    - JSON embedded in surrounding conversational text
+    - JSON arrays (``[...]``) as well as objects (``{...}``)
     - Duplicated / repeated JSON blocks (via repair)
+
+    The extraction pipeline:
+    1. Direct parse of the full text.
+    2. Markdown code-fence extraction (prefers ```json).
+    3. Brace/bracket-depth balanced extraction (first complete
+       JSON value in the text).
+    4. Duplicated-text repair as a last resort.
 
     Returns:
         The JSON string if found, or None.
     """
     text = text.strip()
 
-    # 1. Try direct parse
+    # 1. Try direct parse — the response is already pure JSON.
     try:
         json.loads(text)
         return text
     except json.JSONDecodeError:
         pass
 
-    # 2. Try markdown code fences
-    fence_patterns = [
-        r'```json\s*\n(.*?)\n\s*```',
-        r'```\s*\n(.*?)\n\s*```',
-    ]
-    for pattern in fence_patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            candidate = match.group(1).strip()
-            try:
-                json.loads(candidate)
-                return candidate
-            except json.JSONDecodeError:
-                continue
+    # 2. Try markdown code fences (handles the very common
+    #    "Here is the result:\n```json\n{...}\n```\nDone." pattern).
+    result = _extract_from_fences(text)
+    if result is not None:
+        return result
 
-    # 3. Try to find a JSON object by matching outermost braces
-    start = text.find('{')
-    end = text.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
-        try:
-            json.loads(candidate)
-            return candidate
-        except json.JSONDecodeError:
-            pass
+    # 3. Depth-balanced extraction — walk the text to find the first
+    #    complete JSON object ``{...}`` or array ``[...]``.
+    result = _extract_by_brace_depth(text)
+    if result is not None:
+        return result
 
-    # 4. Try to repair duplicated text blocks
+    # 4. Try to repair duplicated text blocks (model "stuttering").
     repaired = repair_duplicated_text(text)
     if repaired != text:
         try:
