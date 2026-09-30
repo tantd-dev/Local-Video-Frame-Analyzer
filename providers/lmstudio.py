@@ -53,9 +53,33 @@ class LMStudioProvider(AIProvider):
             json=payload,
             timeout=timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            try:
+                err_data = resp.json()
+                err_obj = err_data.get('error', {})
+                err_msg = err_obj.get('message', '') if isinstance(err_obj, dict) else str(err_obj)
+                if err_msg:
+                    raise requests.HTTPError(
+                        f"LM Studio ({resp.status_code}): {err_msg}",
+                        response=resp,
+                    ) from e
+            except requests.HTTPError:
+                raise
+            except Exception:
+                pass
+            raise
+
         data = resp.json()
-        return data['choices'][0]['message']['content']
+        choices = data.get('choices', [])
+        if not choices:
+            return ""
+        msg = choices[0].get('message', {})
+        content = msg.get('content')
+        if not content:
+            content = msg.get('reasoning_content') or ""
+        return content
 
     def generate_text(
         self,
@@ -78,6 +102,30 @@ class LMStudioProvider(AIProvider):
             json=payload,
             timeout=timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            try:
+                err_data = resp.json()
+                err_obj = err_data.get('error', {})
+                err_msg = err_obj.get('message', '') if isinstance(err_obj, dict) else str(err_obj)
+                if err_msg:
+                    raise requests.HTTPError(
+                        f"LM Studio ({resp.status_code}): {err_msg}",
+                        response=resp,
+                    ) from e
+            except requests.HTTPError:
+                raise
+            except Exception:
+                pass
+            raise
+
         data = resp.json()
-        return data['choices'][0]['message']['content']
+        choices = data.get('choices', [])
+        if not choices:
+            return ""
+        msg = choices[0].get('message', {})
+        content = msg.get('content')
+        if not content:
+            content = msg.get('reasoning_content') or ""
+        return content

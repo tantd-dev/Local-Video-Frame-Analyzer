@@ -52,9 +52,29 @@ class OllamaProvider(AIProvider):
             json=payload,
             timeout=timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get('error', '')
+                if err_msg:
+                    raise requests.HTTPError(
+                        f"Ollama ({resp.status_code}): {err_msg}",
+                        response=resp,
+                    ) from e
+            except requests.HTTPError:
+                raise
+            except Exception:
+                pass
+            raise
+
         data = resp.json()
-        return data['message']['content']
+        msg = data.get('message', {})
+        content = msg.get('content')
+        if not content:
+            content = msg.get('thinking') or ""
+        return content
 
     def generate_text(
         self,
@@ -79,6 +99,26 @@ class OllamaProvider(AIProvider):
             json=payload,
             timeout=timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            try:
+                err_data = resp.json()
+                err_msg = err_data.get('error', '')
+                if err_msg:
+                    raise requests.HTTPError(
+                        f"Ollama ({resp.status_code}): {err_msg}",
+                        response=resp,
+                    ) from e
+            except requests.HTTPError:
+                raise
+            except Exception:
+                pass
+            raise
+
         data = resp.json()
-        return data['message']['content']
+        msg = data.get('message', {})
+        content = msg.get('content')
+        if not content:
+            content = msg.get('thinking') or ""
+        return content

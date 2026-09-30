@@ -185,6 +185,72 @@ def test_json_extraction():
     assert parsed is not None, f"Failed braces-outside test: {err}"
     assert parsed["summary"] == "braces outside"
 
+    # --- Thinking model tags (<think>...</think>) ---
+    j10 = (
+        "<think>\n"
+        "Let me analyze these frames. The user wants JSON like:\n"
+        '{"scenes": ["draft"]}\n'
+        "Now generating real output:\n"
+        "</think>\n\n"
+        "```json\n"
+        '{\n  "summary": "DeepSeek R1 thinking test",\n'
+        '  "scenes": ["actual scene"]\n'
+        "}\n"
+        "```"
+    )
+    parsed, err = safe_parse_json(j10)
+    assert parsed is not None, f"Failed thinking model test: {err}"
+    assert parsed["summary"] == "DeepSeek R1 thinking test"
+
+    # --- Trailing commas in objects and arrays ---
+    j11 = (
+        "```json\n"
+        "{\n"
+        '  "summary": "Trailing commas test",\n'
+        '  "scenes": ["scene 1", "scene 2",],\n'
+        "}\n"
+        "```"
+    )
+    parsed, err = safe_parse_json(j11)
+    assert parsed is not None, f"Failed trailing comma test: {err}"
+    assert parsed["summary"] == "Trailing commas test"
+
+    # --- Single quotes & Python literals (True/False/None) ---
+    j12 = "{'summary': 'Python dict test', 'scenes': ['test'], 'valid': True, 'extra': None}"
+    parsed, err = safe_parse_json(j12)
+    assert parsed is not None, f"Failed python dict test: {err}"
+    assert parsed["summary"] == "Python dict test"
+
+    # --- Comments inside JSON (// and /* */) ---
+    j13 = (
+        "{\n"
+        "  // Video summary\n"
+        '  "summary": "Comment test",\n'
+        "  /* detailed scenes */\n"
+        '  "scenes": ["scene 1"]\n'
+        "}"
+    )
+    parsed, err = safe_parse_json(j13)
+    assert parsed is not None, f"Failed comment test: {err}"
+    assert parsed["summary"] == "Comment test"
+
+    # --- Unclosed markdown fence ---
+    j14 = "```json\n{\n  \"summary\": \"Unclosed fence test\"\n}"
+    parsed, err = safe_parse_json(j14)
+    assert parsed is not None, f"Failed unclosed fence test: {err}"
+    assert parsed["summary"] == "Unclosed fence test"
+
+    # --- Truncated JSON (missing closing braces) ---
+    j15 = '{"summary": "Truncated test", "scenes": ["cut off"'
+    parsed, err = safe_parse_json(j15)
+    assert parsed is not None, f"Failed truncated JSON test: {err}"
+    assert parsed["summary"] == "Truncated test"
+
+    # --- None and empty safety ---
+    assert safe_parse_json(None) == (None, "Empty response from model")
+    assert safe_parse_json("") == (None, "Empty response from model")
+    assert safe_parse_json("   ") == (None, "Empty response from model")
+
     print("  ✓ JSON extraction & parsing")
 
 

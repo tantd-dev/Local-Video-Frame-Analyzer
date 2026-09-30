@@ -216,14 +216,40 @@ class BatchWorker(QObject):
         full_prompt = build_batch_prompt(batch, self.user_prompt)
 
         # Call provider
-        raw_response = self.provider.analyze_images(
-            images=images,
-            prompt=full_prompt,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            timeout=self.timeout,
-        )
+        try:
+            raw_response = self.provider.analyze_images(
+                images=images,
+                prompt=full_prompt,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+            )
+        except Exception as call_err:
+            finished_at = datetime.now()
+            return {
+                'run_id': self.run_id,
+                'batch_id': batch.batch_id,
+                'total_batches': self.total_batches,
+                'frames': [
+                    {'filename': f.filename, 'timestamp_seconds': f.timestamp_seconds}
+                    for f in batch.frames
+                ],
+                'provider': self.provider.provider_name,
+                'model': self.model,
+                'prompt': self.user_prompt,
+                'raw_response': '',
+                'processing': {
+                    'started_at': started_at.isoformat(),
+                    'finished_at': finished_at.isoformat(),
+                    'duration_seconds': round(
+                        (finished_at - started_at).total_seconds(), 2
+                    ),
+                    'status': 'failed',
+                },
+                'error_type': f'API error: {call_err}',
+                'retry_attempted': False,
+            }
 
         # Try to parse JSON
         parsed, error = safe_parse_json(raw_response)
@@ -579,10 +605,10 @@ class MultiVideoWorker(QObject):
                     )
                 else:
                     failed_count += 1
-                    self.video_failed.emit(idx, video_name, "Processing returned no result")
+                    self.video_failed.emit(idx, video_name, "Cancelled by user")
             except Exception as e:
                 failed_count += 1
-                error_msg = f"{type(e).__name__}: {e}"
+                error_msg = str(e)
                 self.log_message.emit(
                     f"═══ [{idx+1}/{total_videos}] FAILED: {video_name} — {error_msg} ═══"
                 )
@@ -623,7 +649,7 @@ class MultiVideoWorker(QObject):
         frames = discover_frames(frames_path)
         if not frames:
             self.log_message.emit(f"[{video_name}] No frames found, skipping.")
-            return None
+            raise ValueError(f"No frames found in folder '{frames_path}'")
 
         stats = get_frame_stats(frames)
         self.log_message.emit(
@@ -664,6 +690,7 @@ class MultiVideoWorker(QObject):
         batches_start = time.time()
         successful = 0
         failed = 0
+        last_error = ""
 
         for batch in batches:
             if self._cancelled:
@@ -689,6 +716,7 @@ class MultiVideoWorker(QObject):
                 else:
                     failed += 1
                     error_type = result.get('error_type', 'unknown')
+                    last_error = error_type
                     raw_preview = result.get('raw_response', '')[:200]
                     self.log_message.emit(
                         f"[{video_name}] Batch {batch.batch_id} ✗ {error_type}"
@@ -698,6 +726,7 @@ class MultiVideoWorker(QObject):
                     )
             except Exception as e:
                 failed += 1
+                last_error = str(e)
                 self.log_message.emit(
                     f"[{video_name}] Batch {batch.batch_id} exception: {e}"
                 )
@@ -709,8 +738,9 @@ class MultiVideoWorker(QObject):
         )
 
         if successful == 0:
-            self.log_message.emit(f"[{video_name}] No successful batches, skipping aggregation.")
-            return None
+            err = last_error or "All batches failed"
+            self.log_message.emit(f"[{video_name}] No successful batches ({err}), skipping aggregation.")
+            raise RuntimeError(f"All {total_batches} batches failed: {err}")
 
         # 5. Run aggregation
         self.log_message.emit(f"[{video_name}] Starting aggregation...")
@@ -744,7 +774,7 @@ class MultiVideoWorker(QObject):
                 self.log_message.emit(
                     f"[{video_name}] Aggregation failed: could not parse JSON. Error: {error}"
                 )
-                return None
+                raise RuntimeError(f"Aggregation failed: could not parse JSON ({error})")
 
         agg_duration = round(time.time() - agg_start, 2)
         total_duration = round(time.time() - video_start, 2)
@@ -838,14 +868,40 @@ class MultiVideoWorker(QObject):
 
         full_prompt = build_batch_prompt(batch, self.batch_prompt)
 
-        raw_response = self.provider.analyze_images(
-            images=images,
-            prompt=full_prompt,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            timeout=self.timeout,
-        )
+        try:
+            raw_response = self.provider.analyze_images(
+                images=images,
+                prompt=full_prompt,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+            )
+        except Exception as call_err:
+            finished_at = datetime.now()
+            return {
+                'run_id': run_id,
+                'batch_id': batch.batch_id,
+                'total_batches': total_batches,
+                'frames': [
+                    {'filename': f.filename, 'timestamp_seconds': f.timestamp_seconds}
+                    for f in batch.frames
+                ],
+                'provider': self.provider.provider_name,
+                'model': self.model,
+                'prompt': self.batch_prompt,
+                'raw_response': '',
+                'processing': {
+                    'started_at': started_at.isoformat(),
+                    'finished_at': finished_at.isoformat(),
+                    'duration_seconds': round(
+                        (finished_at - started_at).total_seconds(), 2
+                    ),
+                    'status': 'failed',
+                },
+                'error_type': f'API error: {call_err}',
+                'retry_attempted': False,
+            }
 
         parsed, error = safe_parse_json(raw_response)
 
