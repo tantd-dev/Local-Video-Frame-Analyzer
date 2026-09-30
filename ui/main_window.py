@@ -688,9 +688,13 @@ class MultiVideoWorker(QObject):
                     )
                 else:
                     failed += 1
+                    error_type = result.get('error_type', 'unknown')
+                    raw_preview = result.get('raw_response', '')[:200]
                     self.log_message.emit(
-                        f"[{video_name}] Batch {batch.batch_id} ✗ "
-                        f"{result.get('error_type', 'unknown')}"
+                        f"[{video_name}] Batch {batch.batch_id} ✗ {error_type}"
+                    )
+                    self.log_message.emit(
+                        f"[{video_name}] Raw response preview: {raw_preview!r}"
                     )
             except Exception as e:
                 failed += 1
